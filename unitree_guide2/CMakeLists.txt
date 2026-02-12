@@ -82,7 +82,7 @@ if(CATKIN_MAKE)
         add_definitions(-DCOMPILE_WITH_SIMULATION)
         find_package(controller_manager REQUIRED)
         find_package(joint_trajectory_controller REQUIRED)
-        find_package(gazebo_ros REQUIRED)
+        find_package(ros_gz_sim REQUIRED)
     endif()
 
     # find_package(rosidl_generator REQUIRED)

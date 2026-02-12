@@ -8,8 +8,8 @@ controller_manager:
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
-    imu_sensor_broadcaster:
-      type: imu_sensor_broadcaster/ImuSensorBroadcaster
+    # imu_sensor_broadcaster:
+    #   type: imu_sensor_broadcaster/ImuSensorBroadcaster
 
     FR_hip_controller:
       type: ros2_unitree_legged_control/UnitreeLeggedController
@@ -314,11 +314,11 @@ RL_calf_controller:
 #         d: 8.0
 
 
-imu_sensor_broadcaster:
-   ros__parameters:
+# imu_sensor_broadcaster:
+#    ros__parameters:
 
-      sensor_name: "imu_sensor"
-      frame_id: imu_link
+#       sensor_name: "imu_sensor"
+#       frame_id: imu_link
 
       # interface_names.orientation.x: imu_sensor/orientation.x
       # interface_names.orientation.y: imu_sensor/orientation.y

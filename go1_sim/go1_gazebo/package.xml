@@ -13,7 +13,7 @@
   <test_depend>ament_lint_common</test_depend>
 
   <depend>robot_state_publisher</depend>
-  <depend>gazebo_ros</depend>
+  <depend>ros_gz</depend>
   <depend>ros2_control</depend>
   <depend>gazebo_ros2_control</depend>
   <depend>imu_sensor_broadcaster</depend>
