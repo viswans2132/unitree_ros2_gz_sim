@@ -4,13 +4,19 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
+    clock_bridge = Node(
+        package="ros_gz_bridge",
+        executable="parameter_bridge",
+        arguments=["/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock"],
+        output="screen",
+    )
     controllers = [
         "joint_state_broadcaster",
         # "imu_sensor_broadcaster",  # enable later when IMU is wired
-        "FR_hip_controller", "FR_thigh_controller", "FR_calf_controller",
-        "FL_hip_controller", "FL_thigh_controller", "FL_calf_controller",
-        "RR_hip_controller", "RR_thigh_controller", "RR_calf_controller",
-        "RL_hip_controller", "RL_thigh_controller", "RL_calf_controller",
+        # "FR_hip_controller", "FR_thigh_controller", "FR_calf_controller",
+        # "FL_hip_controller", "FL_thigh_controller", "FL_calf_controller",
+        # "RR_hip_controller", "RR_thigh_controller", "RR_calf_controller",
+        # "RL_hip_controller", "RL_thigh_controller", "RL_calf_controller",
     ]
 
     spawners = [
@@ -28,5 +34,6 @@ def generate_launch_description():
 
     # Delay start to allow gz_ros2_control to initialize controller_manager
     return LaunchDescription([
-        TimerAction(period=2.0, actions=spawners)
+        clock_bridge,
+        TimerAction(period=3.0, actions=spawners)
     ])
