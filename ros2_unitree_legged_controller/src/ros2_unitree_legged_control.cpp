@@ -44,6 +44,14 @@ controller_interface::CallbackReturn UnitreeLeggedController::on_init()
   try
   {
     declare_parameters();
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+
+    robot_desc_sub_ = get_node()->create_subscription<std_msgs::msg::String>("/robot_description", qos, 
+                    [this](const std_msgs::msg::String::SharedPtr msg) 
+                    {urdf_string_ = msg->data; 
+                    urdf_received_.store(true, std::memory_order_release);
+                    });
+
 
     // Initialize variables and pointers
   }
@@ -61,48 +69,113 @@ void UnitreeLeggedController::declare_parameters()
   param_listener_ = std::make_shared<ParamListener>(get_node());
 }
 
-controller_interface::CallbackReturn UnitreeLeggedController::read_parameters(){
+controller_interface::CallbackReturn UnitreeLeggedController::read_parameters()
+{
+  if (!param_listener_) {
+    RCLCPP_ERROR(get_node()->get_logger(), "param_listener does not exist");
+    return controller_interface::CallbackReturn::ERROR;
+  }
 
-  // Read joint name here, used in state and interface configuration
-  // Custom param struct is generated accodring to yaml file under ros2_unitree_legged_control_parameters.hpp
+  params_ = param_listener_->get_params();
+  if (params_.joint_name.empty()) {
+    RCLCPP_ERROR(get_node()->get_logger(), "'joint_name' parameter was empty");
+    return controller_interface::CallbackReturn::ERROR;
+  }
 
-  if (!param_listener_)
-    {
-      RCLCPP_ERROR(get_node()->get_logger(), "Error encountered during init. param_listener does not exist");
-      return controller_interface::CallbackReturn::ERROR;
-    }
-    params_ = param_listener_->get_params();
+  joint_name_ = params_.joint_name;
 
-    if (params_.joint_name.empty())
-    {
-      RCLCPP_ERROR(get_node()->get_logger(), "'joint_name' parameter was empty");
-      return controller_interface::CallbackReturn::ERROR;
-    }
+  // MUST have URDF string, otherwise model_ stays empty
+  // if (!get_node()->get_parameter("robot_description", urdf_string_)) {
+  //   RCLCPP_ERROR(get_node()->get_logger(),
+  //                "robot_description parameter not set on controller node.");
+  //   return controller_interface::CallbackReturn::ERROR;
+  // }
 
-    if(get_node()->get_parameter("robot_description", urdf_string_)){
-      if (!model_.initString(urdf_string_)){
-        RCLCPP_ERROR(get_node()->get_logger(), "Failed to parse URDF string");
-        return controller_interface::CallbackReturn::ERROR; 
-      }
-    }
+  // if (!model_.initString(urdf_string_)) {
+  //   RCLCPP_ERROR(get_node()->get_logger(), "Failed to parse URDF string");
+  //   return controller_interface::CallbackReturn::ERROR;
+  // }
 
-    joint_name_ = params_.joint_name;
-    joint_ = model_.getJoint(joint_name_);
+  // joint_ = model_.getJoint(joint_name_);
+  // if (!joint_) {
+  //   RCLCPP_ERROR(get_node()->get_logger(), "URDF joint '%s' not found", joint_name_.c_str());
+  //   return controller_interface::CallbackReturn::ERROR;
+  // }
+  // if (!joint_->limits) {
+  //   RCLCPP_ERROR(get_node()->get_logger(),
+  //                "URDF joint '%s' has no limits (<limit .../> missing).",
+  //                joint_name_.c_str());
+  //   return controller_interface::CallbackReturn::ERROR;
+  // }
 
-    // if(joint_name_.find("hip") != std::string::npos){
-    //   joint_type_ = 0;
-    // }
-    // else if(joint_name_.find("thigh") != std::string::npos){
-    //   joint_type_ = 1;
-    // }
-    // else if(joint_name_.find("calf") != std::string::npos){
-    //   joint_type_ = 2;
-    // }
+  // RCLCPP_INFO_STREAM(get_node()->get_logger(),
+  //                    "Configured joint: " << joint_name_ << " effort_limit=" << joint_->limits->effort);
 
-    RCLCPP_INFO_STREAM(get_node()->get_logger(), "Configured joint: " << joint_name_ << "with type: " << joint_type_);
+  // --- URDF acquisition (Jazzy-friendly) ---
+  limits_loaded_ = false;
 
-    return controller_interface::CallbackReturn::SUCCESS;
+  // Optional: allow explicit param if someone sets it (not default in Jazzy)
+  std::string tmp;
+  if (get_node()->get_parameter("robot_description", tmp) && !tmp.empty()) {
+    urdf_string_ = tmp;
+    urdf_received_.store(true, std::memory_order_release);
+  }
+
+  // Primary source: latched topic /robot_description
+  if (!urdf_received_.load(std::memory_order_acquire) || urdf_string_.empty()) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+      "URDF not available yet. Expected /robot_description (RELIABLE + TRANSIENT_LOCAL). "
+      "Refusing to configure so we don't crash Gazebo.");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+
+  if (!model_.initString(urdf_string_)) {
+    RCLCPP_ERROR(get_node()->get_logger(), "Failed to parse URDF string");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+
+  joint_ = model_.getJoint(joint_name_);
+  if (!joint_) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+      "URDF joint '%s' not found in kinematic <joint name='...'> definitions",
+      joint_name_.c_str());
+    return controller_interface::CallbackReturn::ERROR;
+  }
+
+  if (!joint_->limits) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+      "URDF joint '%s' has no <limit .../> tag",
+      joint_name_.c_str());
+    return controller_interface::CallbackReturn::ERROR;
+  }
+
+  // Cache limits (RT-safe usage in update())
+  effort_limit_ = joint_->limits->effort;
+  vel_limit_    = joint_->limits->velocity;
+  lower_limit_  = joint_->limits->lower;
+  upper_limit_  = joint_->limits->upper;
+
+  if (!std::isfinite(effort_limit_) || effort_limit_ <= 0.0 ||
+      !std::isfinite(vel_limit_)    || vel_limit_    <= 0.0 ||
+      !std::isfinite(lower_limit_)  || !std::isfinite(upper_limit_) ||
+      lower_limit_ >= upper_limit_) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+      "Invalid URDF limits for joint '%s': effort=%f vel=%f pos=[%f,%f]",
+      joint_name_.c_str(), effort_limit_, vel_limit_, lower_limit_, upper_limit_);
+    return controller_interface::CallbackReturn::ERROR;
+  }
+
+  limits_loaded_ = true;
+
+  RCLCPP_INFO(get_node()->get_logger(),
+    "Configured joint '%s' limits: effort=%g vel=%g pos=[%g,%g]",
+    joint_name_.c_str(), effort_limit_, vel_limit_, lower_limit_, upper_limit_);
+
+
+
+  return controller_interface::CallbackReturn::SUCCESS;
 }
+
 
 void UnitreeLeggedController::setCmdCallback(const ros2_unitree_legged_msgs::msg::MotorCmd::SharedPtr msg){
   lastCmd.mode = msg->mode;
@@ -124,6 +197,7 @@ controller_interface::CallbackReturn UnitreeLeggedController::on_configure(
     return ret;
   }
 
+  
   // command callback
   joints_command_subscriber_ = get_node()->create_subscription<CmdType>(
     "~/command", rclcpp::SystemDefaultsQoS(), std::bind(&UnitreeLeggedController::setCmdCallback, this, std::placeholders::_1));
@@ -167,6 +241,11 @@ controller_interface::CallbackReturn UnitreeLeggedController::on_activate(
   const rclcpp_lifecycle::State & previous_state)
 {
 
+if (!limits_loaded_) {
+  RCLCPP_ERROR(get_node()->get_logger(),
+    "Refusing to activate: joint limits not loaded (URDF missing or invalid).");
+  return controller_interface::CallbackReturn::ERROR;
+}
   // TODO
   //  check if we have all resources defined in the "points" parameter
   //  also verify that we *only* have the resources defined in the "points" parameter
@@ -312,86 +391,26 @@ void UnitreeLeggedController::getGains(double &p, double &i, double &d, double &
 {
   pid_controller_.getGains(p,i,d,i_max,i_min,antiwindup);
 }
-
-void UnitreeLeggedController::positionLimits(double &position){
-  clamp(position, joint_->limits->lower, joint_->limits->upper);
-  // switch (joint_type_){
-  //   double upper, lower;
-  //   case 0:
-  //   // hip
-  //     lower = -0.863, upper = 0.863;
-  //     clamp(position, lower, upper);
-  //     break;
-
-  //   case 1:
-  //   // thigh
-  //     lower = -0.686, upper = 4.501;
-  //     clamp(position, lower, upper);
-  //     break;
-
-  //   case 2:
-  //   // calf
-  //     lower = -2.818, upper = -0.888;
-  //     clamp(position, lower, upper);
-  //     break;
-
-  //   default:
-  //     break;
-  // }
+void UnitreeLeggedController::positionLimits(double & position)
+{
+  if (!limits_loaded_) return;
+  position = std::clamp(position, lower_limit_, upper_limit_);
 }
 
-void UnitreeLeggedController::velocityLimits(double &velocity){
-  clamp(velocity, -joint_->limits->velocity, joint_->limits->velocity);
-  // switch (joint_type_){
-  //   case 0:
-  //   // hip
-  //     lower = -30.1, upper = 30.1;
-  //     clamp(velocity, lower, upper);
-  //     break;
-
-  //   case 1:
-  //   // thigh
-  //     lower = -30.1, upper = 30.1;
-  //     clamp(velocity, lower, upper);
-  //     break;
-
-  //   case 2:
-  //   // calf
-  //     lower = -20.06, upper = 20.06;
-  //     clamp(velocity, lower, upper);
-  //     break;
-
-  //   default:
-  //     break;
-  // }
+void UnitreeLeggedController::velocityLimits(double & velocity)
+{
+  if (!limits_loaded_) return;
+  velocity = std::clamp(velocity, -vel_limit_, vel_limit_);
 }
 
-void UnitreeLeggedController::effortLimits(double &effort){
-  clamp(effort, -joint_->limits->effort, joint_->limits->effort);
-  // double upper, lower;
-  // switch (joint_type_){
-  //   case 0:
-  //   // hip
-  //     lower = -23.7, upper = 23.7;
-  //     clamp(effort, lower, upper);
-  //     break;
-
-  //   case 1:
-  //   // thigh
-  //     lower = -23.7, upper = 23.7;
-  //     clamp(effort, lower, upper);
-  //     break;
-
-  //   case 2:
-  //   // calf
-  //     lower = -35.5, upper = 35.5;
-  //     clamp(effort, lower, upper);
-  //     break;
-
-  //   default:
-  //     break;
-  // }
+void UnitreeLeggedController::effortLimits(double & effort)
+{
+  if (!limits_loaded_) return;
+  effort = std::clamp(effort, -effort_limit_, effort_limit_);
 }
+
+
+
 
 }  // namespace effort_controllers
 

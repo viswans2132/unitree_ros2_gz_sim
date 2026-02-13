@@ -7,10 +7,10 @@ def generate_launch_description():
     controllers = [
         "joint_state_broadcaster",
         # "imu_sensor_broadcaster",  # enable later when IMU is wired
-        # "FR_hip_controller", "FR_thigh_controller", "FR_calf_controller",
-        # "FL_hip_controller", "FL_thigh_controller", "FL_calf_controller",
-        # "RR_hip_controller", "RR_thigh_controller", "RR_calf_controller",
-        # "RL_hip_controller", "RL_thigh_controller", "RL_calf_controller",
+        "FR_hip_controller", "FR_thigh_controller", "FR_calf_controller",
+        "FL_hip_controller", "FL_thigh_controller", "FL_calf_controller",
+        "RR_hip_controller", "RR_thigh_controller", "RR_calf_controller",
+        "RL_hip_controller", "RL_thigh_controller", "RL_calf_controller",
     ]
 
     spawners = [
@@ -19,6 +19,9 @@ def generate_launch_description():
             executable="spawner",
             arguments=[c, "-c", "/controller_manager"],
             output="screen",
+            parameters=[{
+                "use_sim_time": True,
+            }],
         )
         for c in controllers
     ]

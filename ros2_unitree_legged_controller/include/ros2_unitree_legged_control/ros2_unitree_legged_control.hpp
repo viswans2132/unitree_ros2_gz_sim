@@ -35,6 +35,8 @@
 #include "std_msgs/msg/float64.hpp"
 #include "ros2_unitree_legged_control/unitree_joint_control_tool.h"
 #include <urdf/model.h>
+#include <atomic>
+#include "std_msgs/msg/string.hpp"
 
 #define PMSM      (0x0A)
 #define BRAKE     (0x00)
@@ -125,6 +127,16 @@ protected:
 
   urdf::Model model_;
   std::string urdf_string_;
+
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_desc_sub_;
+  std::atomic_bool urdf_received_{false};
+
+  // Cached limits (avoid dereferencing joint_->limits in update())
+  bool limits_loaded_{false};
+  double effort_limit_{0.0};
+  double vel_limit_{0.0};
+  double lower_limit_{0.0};
+  double upper_limit_{0.0};
 
   std::string joint_name_;
   int joint_type_; // enumize later
