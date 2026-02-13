@@ -21,6 +21,8 @@ def generate_launch_description():
     # --- Process xacro -> URDF string ---
     pkg_path = get_package_share_directory(package_description)
     xacro_file = os.path.join(pkg_path, "xacro", "robot.xacro")
+    print(f"Xacro file inside the robot_state_publisher_node: {xacro_file}")
+
 
     # If you have xacro args, pass them here via mappings={...}
     robot_description = xacro.process_file(xacro_file).toxml()
@@ -71,5 +73,6 @@ def generate_launch_description():
         ),
         robot_state_publisher_node,
         joint_state_publisher_node,
+
         rviz_node,
     ])

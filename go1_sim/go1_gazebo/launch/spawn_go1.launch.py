@@ -57,6 +57,9 @@ def generate_launch_description():
     # robot_name = LaunchConfiguration("robot_name") 
     robot_name = "GO1"
 
+    use_sim_time = LaunchConfiguration("use_sim_time")
+
+
     world_file_name_arg = DeclareLaunchArgument(
         "world_file_name",
         default_value="cylinder_world.sdf",
@@ -65,6 +68,11 @@ def generate_launch_description():
     urdf_file_arg = DeclareLaunchArgument(
         "urdf_file",
         default_value="robot.xacro",
+    )
+
+    use_sim_time_arg = DeclareLaunchArgument(
+        "use_sim_time",
+        default_value="True",
     )
 
     go1_share_parent = os.path.join(get_package_prefix('go1_description'), 'share')
@@ -84,6 +92,8 @@ def generate_launch_description():
     # Paths
     go1_gazebo_share = get_package_share_directory("go1_gazebo")
     go1_desc_share = get_package_share_directory("go1_description")
+    robot_xacro_path = os.path.join(go1_desc_share, "xacro", "robot.xacro")
+    robot_description = xacro.process_file(robot_xacro_path).toprettyxml(indent="  ")
 
     world_path = os.path.join(go1_gazebo_share, "worlds", world_file_name.perform({}) if False else "")
     # NOTE: We can't resolve LaunchConfiguration at generation-time without OpaqueFunction.
@@ -235,7 +245,16 @@ def generate_launch_description():
         )
     )
 
-    dump_action = OpaqueFunction(function=dump_urdf)
+    robot_description_publisher = Node(
+        package="go1_gazebo",
+        executable="robot_description_publisher",
+        name="robot_description_publisher",
+        output="screen",
+        parameters=[{
+            "robot_description": robot_description,
+            "use_sim_time": use_sim_time,
+        }],
+    )
 
 
 
@@ -243,8 +262,10 @@ def generate_launch_description():
         set_gz_path,
         world_file_name_arg,
         urdf_file_arg,
+        use_sim_time_arg,
         gz_sim_launch,
         visualize_robot,
+        # robot_description_publisher,
         spawn_robot,
         bridges_after_spawn,
         controllers_after_spawn,
