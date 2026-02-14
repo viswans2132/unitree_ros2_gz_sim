@@ -25,8 +25,180 @@
 #include "rclcpp/logging.hpp"
 #include "rclcpp/qos.hpp"
 
+#include <condition_variable>
+#include <mutex>
+#include <unordered_map>
+
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp/wait_set.hpp>
+#include <std_msgs/msg/string.hpp>
+
+
 namespace ros2_unitree_legged_control
 {
+
+struct JointLimits {
+  double effort{0.0};
+  double vel{0.0};
+  double lower{0.0};
+  double upper{0.0};
+};
+
+class RobotDescriptionCache {
+public:
+  // Ensure cache is populated once (blocks only on first call)
+  bool ensure_ready(
+    const rclcpp_lifecycle::LifecycleNode::SharedPtr& node,
+    std::chrono::milliseconds timeout)
+  {
+    std::unique_lock<std::mutex> lk(mtx_);
+
+    // already built
+    if (ready_) {
+      return true;
+    }
+
+    // another controller is building it -> wait
+    if (fetch_in_progress_) {
+      return cv_.wait_for(lk, timeout, [this]() { return ready_; });
+    }
+
+    // this controller becomes the builder
+    fetch_in_progress_ = true;
+    lk.unlock();
+
+    // slow work outside lock
+    std::string urdf;
+    std::unordered_map<std::string, JointLimits> tmp;
+    bool ok = fetch_robot_description_blocking_(node, urdf, timeout) &&
+              parse_limits_(urdf, tmp, node->get_logger());
+
+    // publish result
+    lk.lock();
+    if (ok) {
+      limits_ = std::move(tmp);
+      ready_ = true;
+    }
+    fetch_in_progress_ = false;
+    lk.unlock();
+    cv_.notify_all();
+
+    return ok;
+  }
+
+  bool get_limits(const std::string& joint, JointLimits& out) const
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!ready_) return false;
+    auto it = limits_.find(joint);
+    if (it == limits_.end()) return false;
+    out = it->second;
+    return true;
+  }
+
+private:
+  bool fetch_robot_description_blocking_(
+  const rclcpp_lifecycle::LifecycleNode::SharedPtr& node,
+  std::string& urdf_out,
+  std::chrono::milliseconds timeout)
+{
+  // 1) Optional param fallback
+  std::string tmp;
+  if (node->get_parameter("robot_description", tmp) && !tmp.empty()) {
+    urdf_out = tmp;
+    return true;
+  }
+
+  // 2) Create a TEMP node in the same rcl context (NOT in controller_manager executor)
+  rclcpp::NodeOptions opts;
+  opts.context(node->get_node_base_interface()->get_context());
+  auto temp_node = std::make_shared<rclcpp::Node>("urdf_fetch_node", opts);
+
+  rclcpp::QoS qos(rclcpp::KeepLast(1));
+  qos.reliable();
+  qos.transient_local();
+
+  auto sub = temp_node->create_subscription<std_msgs::msg::String>(
+    "/robot_description", qos,
+    [](std_msgs::msg::String::SharedPtr) {});
+
+  rclcpp::WaitSet ws;
+  ws.add_subscription(sub);
+
+  auto start = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - start < timeout) {
+    auto remaining = timeout - std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start);
+
+    auto res = ws.wait(remaining);
+    if (res.kind() == rclcpp::WaitResultKind::Ready) {
+      std_msgs::msg::String msg;
+      rclcpp::MessageInfo info;
+      if (sub->take(msg, info)) {
+        urdf_out = msg.data;
+        return !urdf_out.empty();
+      }
+    }
+  }
+
+  return false;
+}
+
+
+  bool parse_limits_(
+    const std::string& urdf,
+    std::unordered_map<std::string, JointLimits>& out,
+    const rclcpp::Logger& logger)
+  {
+    urdf::Model model;
+    if (!model.initString(urdf)) {
+      RCLCPP_ERROR(logger, "URDF parse failed in cache.");
+      return false;
+    }
+
+    // Iterate joints and cache limits
+    for (const auto& kv : model.joints_) {
+      const auto& joint_name = kv.first;
+      const auto& joint = kv.second;
+
+      if (!joint) continue;
+      if (!joint->limits) continue;  // skip joints without <limit>
+
+      JointLimits lim;
+      lim.effort = joint->limits->effort;
+      lim.vel    = joint->limits->velocity;
+
+      // Only revolute/prismatic have bounds that matter
+      lim.lower  = joint->limits->lower;
+      lim.upper  = joint->limits->upper;
+
+      out.emplace(joint_name, lim);
+    }
+
+    if (out.empty()) {
+      RCLCPP_ERROR(logger, "No joint limits found while building cache.");
+      return false;
+    }
+    return true;
+  }
+
+private:
+  mutable std::mutex mtx_;
+  std::condition_variable cv_;
+  bool ready_{false};
+  bool fetch_in_progress_{false};
+  std::unordered_map<std::string, JointLimits> limits_;
+};
+
+RobotDescriptionCache& global_cache()
+{
+  static RobotDescriptionCache cache;
+  return cache;
+}
+
+
+
+
 UnitreeLeggedController::UnitreeLeggedController()
 : controller_interface::ControllerInterface(),
   joints_command_subscriber_(nullptr), rt_controller_state_publisher_(nullptr), state_publisher_(nullptr)
@@ -44,13 +216,13 @@ controller_interface::CallbackReturn UnitreeLeggedController::on_init()
   try
   {
     declare_parameters();
-    auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    // auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
 
-    robot_desc_sub_ = get_node()->create_subscription<std_msgs::msg::String>("/robot_description", qos, 
-                    [this](const std_msgs::msg::String::SharedPtr msg) 
-                    {urdf_string_ = msg->data; 
-                    urdf_received_.store(true, std::memory_order_release);
-                    });
+    // robot_desc_sub_ = get_node()->create_subscription<std_msgs::msg::String>("/robot_description", qos, 
+    //                 [this](const std_msgs::msg::String::SharedPtr msg) 
+    //                 {urdf_string_ = msg->data; 
+    //                 urdf_received_.store(true, std::memory_order_release);
+    //                 });
 
 
     // Initialize variables and pointers
@@ -83,77 +255,29 @@ controller_interface::CallbackReturn UnitreeLeggedController::read_parameters()
   }
 
   joint_name_ = params_.joint_name;
-
-  // MUST have URDF string, otherwise model_ stays empty
-  // if (!get_node()->get_parameter("robot_description", urdf_string_)) {
-  //   RCLCPP_ERROR(get_node()->get_logger(),
-  //                "robot_description parameter not set on controller node.");
-  //   return controller_interface::CallbackReturn::ERROR;
-  // }
-
-  // if (!model_.initString(urdf_string_)) {
-  //   RCLCPP_ERROR(get_node()->get_logger(), "Failed to parse URDF string");
-  //   return controller_interface::CallbackReturn::ERROR;
-  // }
-
-  // joint_ = model_.getJoint(joint_name_);
-  // if (!joint_) {
-  //   RCLCPP_ERROR(get_node()->get_logger(), "URDF joint '%s' not found", joint_name_.c_str());
-  //   return controller_interface::CallbackReturn::ERROR;
-  // }
-  // if (!joint_->limits) {
-  //   RCLCPP_ERROR(get_node()->get_logger(),
-  //                "URDF joint '%s' has no limits (<limit .../> missing).",
-  //                joint_name_.c_str());
-  //   return controller_interface::CallbackReturn::ERROR;
-  // }
-
-  // RCLCPP_INFO_STREAM(get_node()->get_logger(),
-  //                    "Configured joint: " << joint_name_ << " effort_limit=" << joint_->limits->effort);
-
-  // --- URDF acquisition (Jazzy-friendly) ---
   limits_loaded_ = false;
 
-  // Optional: allow explicit param if someone sets it (not default in Jazzy)
-  std::string tmp;
-  if (get_node()->get_parameter("robot_description", tmp) && !tmp.empty()) {
-    urdf_string_ = tmp;
-    urdf_received_.store(true, std::memory_order_release);
-  }
-
-  // Primary source: latched topic /robot_description
-  if (!urdf_received_.load(std::memory_order_acquire) || urdf_string_.empty()) {
+  // Ensure global cache is ready (only first controller blocks)
+  if (!global_cache().ensure_ready(get_node(), std::chrono::milliseconds(2000))) {
     RCLCPP_ERROR(get_node()->get_logger(),
-      "URDF not available yet. Expected /robot_description (RELIABLE + TRANSIENT_LOCAL). "
-      "Refusing to configure so we don't crash Gazebo.");
+      "Failed to build global joint limits cache from URDF.");
     return controller_interface::CallbackReturn::ERROR;
   }
 
-  if (!model_.initString(urdf_string_)) {
-    RCLCPP_ERROR(get_node()->get_logger(), "Failed to parse URDF string");
-    return controller_interface::CallbackReturn::ERROR;
-  }
-
-  joint_ = model_.getJoint(joint_name_);
-  if (!joint_) {
+  // Get this controller's joint limits from cache
+  JointLimits lim;
+  if (!global_cache().get_limits(joint_name_, lim)) {
     RCLCPP_ERROR(get_node()->get_logger(),
-      "URDF joint '%s' not found in kinematic <joint name='...'> definitions",
+      "Joint '%s' not found in URDF limits cache (or missing <limit>).",
       joint_name_.c_str());
     return controller_interface::CallbackReturn::ERROR;
   }
 
-  if (!joint_->limits) {
-    RCLCPP_ERROR(get_node()->get_logger(),
-      "URDF joint '%s' has no <limit .../> tag",
-      joint_name_.c_str());
-    return controller_interface::CallbackReturn::ERROR;
-  }
-
-  // Cache limits (RT-safe usage in update())
-  effort_limit_ = joint_->limits->effort;
-  vel_limit_    = joint_->limits->velocity;
-  lower_limit_  = joint_->limits->lower;
-  upper_limit_  = joint_->limits->upper;
+  // Cache limits into RT-safe doubles for update()
+  effort_limit_ = lim.effort;
+  vel_limit_    = lim.vel;
+  lower_limit_  = lim.lower;
+  upper_limit_  = lim.upper;
 
   if (!std::isfinite(effort_limit_) || effort_limit_ <= 0.0 ||
       !std::isfinite(vel_limit_)    || vel_limit_    <= 0.0 ||
@@ -171,10 +295,9 @@ controller_interface::CallbackReturn UnitreeLeggedController::read_parameters()
     "Configured joint '%s' limits: effort=%g vel=%g pos=[%g,%g]",
     joint_name_.c_str(), effort_limit_, vel_limit_, lower_limit_, upper_limit_);
 
-
-
   return controller_interface::CallbackReturn::SUCCESS;
 }
+
 
 
 void UnitreeLeggedController::setCmdCallback(const ros2_unitree_legged_msgs::msg::MotorCmd::SharedPtr msg){
@@ -205,11 +328,30 @@ controller_interface::CallbackReturn UnitreeLeggedController::on_configure(
   state_publisher_ = get_node()->create_publisher<StateType>(
     "~/state", rclcpp::SystemDefaultsQoS()
   );
-
-  // rt_controller_state_publisher_.reset(
-  //   new realtime_tools::RealtimePublisher<StateType>(state_publisher_)
-  // );
   rt_controller_state_publisher_ = std::make_shared<realtime_tools::RealtimePublisher<StateType>>(state_publisher_);
+
+
+  // 1) Ensure cache exists (only first controller blocks)
+  if (!global_cache().ensure_ready(get_node(), std::chrono::milliseconds(2000))) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+      "Timed out or failed building URDF cache from /robot_description");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+
+  // 2) Read this controller’s joint limits from cache
+  JointLimits lim;
+  if (!global_cache().get_limits(joint_name_, lim)) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+      "Joint '%s' not found in URDF limit cache (or has no <limit>)",
+      joint_name_.c_str());
+    return controller_interface::CallbackReturn::ERROR;
+  }
+
+  // 3) Copy into RT-safe doubles (what your update() clamps against)
+  effort_limit_ = lim.effort;
+  vel_limit_    = lim.vel;
+  lower_limit_  = lim.lower;
+  upper_limit_  = lim.upper;
 
   RCLCPP_INFO(get_node()->get_logger(), "configure successful");
   return controller_interface::CallbackReturn::SUCCESS;
@@ -238,48 +380,52 @@ controller_interface::InterfaceConfiguration UnitreeLeggedController::state_inte
 }
 
 controller_interface::CallbackReturn UnitreeLeggedController::on_activate(
-  const rclcpp_lifecycle::State & previous_state)
+  const rclcpp_lifecycle::State &)
 {
+  activation_time_ = get_node()->now();
+  hold_initialized_ = false;
+  ramp_done_ = false;
 
-if (!limits_loaded_) {
-  RCLCPP_ERROR(get_node()->get_logger(),
-    "Refusing to activate: joint limits not loaded (URDF missing or invalid).");
-  return controller_interface::CallbackReturn::ERROR;
-}
-  // TODO
-  //  check if we have all resources defined in the "points" parameter
-  //  also verify that we *only* have the resources defined in the "points" parameter
-  // ATTENTION(destogl): Shouldn't we use ordered interface all the time?
-  // std::vector<std::reference_wrapper<hardware_interface::LoanedCommandInterface>>
-  //   ordered_interfaces;
-  // if (
-  //   !controller_interface::get_ordered_interfaces(
-  //     command_interfaces_, command_interface_types_, std::string(""), ordered_interfaces) ||
-  //   command_interface_types_.size() != ordered_interfaces.size())
-  // {
-  //   RCLCPP_ERROR(
-  //     get_node()->get_logger(), "Expected %zu command interfaces, got %zu",
-  //     command_interface_types_.size(), ordered_interfaces.size());
-  //   return controller_interface::CallbackReturn::ERROR;
-  // }
+  if (!limits_loaded_) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+      "Refusing to activate: joint limits not loaded (URDF missing or invalid).");
+    return controller_interface::CallbackReturn::ERROR;
+  }
 
-  // reset command buffer if a command came through callback when controller was inactive
-  // rt_command_ = realtime_tools::RealtimeBuffer<CmdType>();
-  RCLCPP_INFO(get_node()->get_logger(), "accessing state interface");
+  // 1) Validate we have expected interfaces
+  if (state_interfaces_.empty()) {
+    RCLCPP_ERROR(get_node()->get_logger(), "No state interfaces available.");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+  if (command_interfaces_.empty()) {
+    RCLCPP_ERROR(get_node()->get_logger(), "No command interfaces available.");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+
+  // 2) Read initial position safely
   double init_pose = state_interfaces_[0].get_value();
-  // Runtime error prone?
-  RCLCPP_INFO(get_node()->get_logger(), "accessing state interface successful");
-  lastCmd.q = (float) init_pose;
-  lastState.q = (float) init_pose;
-  lastCmd.dq = 0;
-  lastState.dq = 0;
-  lastCmd.tau = 0;
-  lastState.tau_est = 0;
-  // rt_command_.initRT(lastCmd);
+  if (!std::isfinite(init_pose)) {
+    RCLCPP_WARN(get_node()->get_logger(),
+      "Initial joint state is not finite (q=%g). Using 0.0 as fallback.", init_pose);
+    init_pose = 0.0;
+  }
 
-  RCLCPP_INFO(get_node()->get_logger(), "activate successful");
+  // 3) Initialize controller internal state
+  lastCmd.q = static_cast<float>(init_pose);
+  lastState.q = static_cast<float>(init_pose);
+  lastCmd.dq = 0.0f;
+  lastState.dq = 0.0f;
+  lastCmd.tau = 0.0f;
+  lastState.tau_est = 0.0f;
+
+  // 4) CRITICAL: initialize commanded effort to 0
+  for (auto & cmd : command_interfaces_) {
+    cmd.set_value(0.0);
+  }
+
   return controller_interface::CallbackReturn::SUCCESS;
 }
+
 
 controller_interface::CallbackReturn UnitreeLeggedController::on_deactivate(
   const rclcpp_lifecycle::State & /*previous_state*/)
@@ -292,86 +438,130 @@ controller_interface::CallbackReturn UnitreeLeggedController::on_deactivate(
 controller_interface::return_type UnitreeLeggedController::update(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
-  // lastCmd = *(*rt_command_.readFromRT());
-  auto joint_commands = rt_command_.readFromRT();
+  const double dt = period.seconds();
+  if (!std::isfinite(dt) || dt <= 1e-6) {
+    command_interfaces_[0].set_value(0.0);
+    return controller_interface::return_type::OK;
+  }
 
-  // // no command received yet. This is only okay for feedforward as it does not provide a feedback
-  if (!joint_commands)
-  {
+  // ---- 1) compute ramp alpha (one-shot after activation) ----
+  double alpha = 1.0;
+  if (!ramp_done_) {
+    const double t = (time - activation_time_).seconds();
+    if (t <= 0.0) {
+      alpha = 0.0;
+    } else if (ramp_sec_ > 1e-6) {
+      alpha = std::clamp(t / ramp_sec_, 0.0, 1.0);
+    } else {
+      alpha = 1.0;
+    }
+
+    if (alpha >= 1.0) {
+      ramp_done_ = true;
+      alpha = 1.0;
+    }
+  }
+
+  // ---- 2) read state safely ----
+  const double currentPos = state_interfaces_[0].get_value();
+  if (!std::isfinite(currentPos)) {
+    command_interfaces_[0].set_value(0.0);
     publishState();
     return controller_interface::return_type::OK;
   }
 
+  double currentVel = computeVel(
+    currentPos,
+    static_cast<double>(lastState.q),
+    static_cast<double>(lastState.dq),
+    dt);
+
+  if (!std::isfinite(currentVel)) {
+    currentVel = 0.0;
+  }
+
+  // ---- 3) read latest command (RT buffer) ----
+  auto joint_commands = rt_command_.readFromRT();
+
+  // ---- 4) If no command has arrived yet: HOLD pose (NOT zero torque) ----
+  if (!joint_commands) {
+    if (!hold_initialized_) {
+      hold_initialized_ = true;
+      hold_pos_ = currentPos;  // latch pose at first update with no command
+    }
+
+    // Simple PD hold
+    double tau = hold_kp_ * (hold_pos_ - currentPos) + hold_kd_ * (0.0 - currentVel);
+
+    if (!std::isfinite(tau)) {
+      tau = 0.0;
+    }
+
+    // Apply startup ramp to avoid jerk at enable
+    tau *= alpha;
+
+    effortLimits(tau);
+    command_interfaces_[0].set_value(tau);
+
+    // Update lastState and publish
+    lastState.q  = static_cast<float>(currentPos);
+    lastState.dq = static_cast<float>(currentVel);
+
+    const double tau_est = state_interfaces_[1].get_value();
+    lastState.tau_est = std::isfinite(tau_est) ? static_cast<float>(tau_est) : 0.0f;
+
+    publishState();
+    return controller_interface::return_type::OK;
+  }
+
+  // ---- 5) Command exists: normal control ----
+  hold_initialized_ = false;  // stop holding once real commands arrive
   lastCmd = *(joint_commands);
-  double currentPos, currentVel, calcTorque;
 
-  if(lastCmd.mode == PMSM) {
-    servoCmd.pos = lastCmd.q;
-    positionLimits(servoCmd.pos);
-    servoCmd.posStiffness = lastCmd.kp;
-    if(fabs(lastCmd.q - PosStopF) < 0.00001){
-        servoCmd.posStiffness = 0;
-    }
-    servoCmd.vel = lastCmd.dq;
-    velocityLimits(servoCmd.vel);
-    servoCmd.velStiffness = lastCmd.kd;
-    if(fabs(lastCmd.dq - VelStopF) < 0.00001){
-        servoCmd.velStiffness = 0;
-    }
-    servoCmd.torque = lastCmd.tau;
-    effortLimits(servoCmd.torque);
-  }
-  if(lastCmd.mode == BRAKE) {
-    servoCmd.posStiffness = 0;
-    servoCmd.vel = 0;
-    servoCmd.velStiffness = 20;
-    servoCmd.torque = 0;
-    effortLimits(servoCmd.torque);
+  // Validate command fields
+  if (!std::isfinite(lastCmd.q)  || !std::isfinite(lastCmd.dq) ||
+      !std::isfinite(lastCmd.kp) || !std::isfinite(lastCmd.kd) ||
+      !std::isfinite(lastCmd.tau)) {
+    command_interfaces_[0].set_value(0.0);
+    publishState();
+    return controller_interface::return_type::OK;
   }
 
-  currentPos = state_interfaces_[0].get_value();    // Position state interface
-  currentVel = computeVel(currentPos, (double)lastState.q, (double)lastState.dq, period.seconds());
-  calcTorque = computeTorque(currentPos, currentVel, servoCmd);
+  // Build servoCmd from lastCmd (make sure it's not stale)
+  servoCmd.mode         = static_cast<uint8_t>(lastCmd.mode);
+  servoCmd.pos          = static_cast<double>(lastCmd.q);
+  servoCmd.vel          = static_cast<double>(lastCmd.dq);
+  servoCmd.posStiffness = static_cast<double>(lastCmd.kp);
+  servoCmd.velStiffness = static_cast<double>(lastCmd.kd);
+  servoCmd.torque       = static_cast<double>(lastCmd.tau);
 
-  // if(joint_name_ == "RL_calf_joint"){
-  //   RCLCPP_INFO_STREAM(get_node()->get_logger(), "i: pos: " << currentPos << " state_q: " << (double)lastState.q << " state_dq: " << (double)lastState.dq << " period " << period.seconds() << " cmd_q: " << servoCmd.pos << " cmd_dq: " << servoCmd.vel << " cmd_tau: " << servoCmd.torque  << " cmd_ps: " <<  servoCmd.posStiffness << " cmd_vs: " <<  servoCmd.velStiffness << " o: vel: " << currentVel << " t: " << calcTorque);
-  // }      
-  // calcTorque = -5.0;
-  // effortLimits(calcTorque);
-  
-  assert (command_interfaces_[0].get_interface_name() == hardware_interface::HW_IF_EFFORT);
-  assert (state_interfaces_[0].get_interface_name() == hardware_interface::HW_IF_POSITION);
-  assert (state_interfaces_[1].get_interface_name() == hardware_interface::HW_IF_EFFORT);
+  positionLimits(servoCmd.pos);
+  velocityLimits(servoCmd.vel);
+  effortLimits(servoCmd.torque);
 
-  command_interfaces_[0].set_value(calcTorque); // Send effort to joint
+  double calcTorque = computeTorque(currentPos, currentVel, servoCmd);
 
-  lastState.q = (float) currentPos;
-  lastState.dq = (float) currentVel;
-  lastState.tau_est = (float) state_interfaces_[1].get_value(); // May cause issues? -> Possibly causing issues. Also check (float) conversion issues
+  if (!std::isfinite(calcTorque)) {
+    calcTorque = 0.0;
+  }
+
+  // Apply startup ramp only during the ramp window
+  calcTorque *= alpha;
+
+  effortLimits(calcTorque);
+  command_interfaces_[0].set_value(calcTorque);
+
+  // Update lastState and publish
+  lastState.q  = static_cast<float>(currentPos);
+  lastState.dq = static_cast<float>(currentVel);
+
+  const double tau_est = state_interfaces_[1].get_value();
+  lastState.tau_est = std::isfinite(tau_est) ? static_cast<float>(tau_est) : 0.0f;
 
   publishState();
-
-  // This is specific to Float64MultiArray (all calls with data)
-  // if ((*joint_commands)->data.size() != command_interfaces_.size())
-  // {
-  //   RCLCPP_ERROR_THROTTLE(
-  //     get_node()->get_logger(), *(get_node()->get_clock()), 1000,
-  //     "command size (%zu) does not match number of interfaces (%zu)",
-  //     (*joint_commands)->data.size(), command_interfaces_.size());
-  //   return controller_interface::return_type::ERROR;
-  // }
-
-  // for (auto index = 0ul; index < command_interfaces_.size(); ++index)
-  // {
-  //   // Unitree controller logic starts
-
-  //   // command_interfaces_[index].set_value((*joint_commands)->data[index]);
-  //   command_interfaces_[index].set_value((*joint_commands)->data[index]);
-  // }
-
   return controller_interface::return_type::OK;
-
 }
+
 
 void UnitreeLeggedController::publishState(){
   if (rt_controller_state_publisher_ && rt_controller_state_publisher_->trylock()) {
