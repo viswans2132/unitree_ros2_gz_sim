@@ -20,23 +20,26 @@
 #include "controller_interface/controller_interface.hpp"
 #include "controller_interface/helpers.hpp"
 #include "ros2_unitree_legged_control/visibility_control.h"
-#include "rclcpp/subscription.hpp"
+// #include "rclcpp/subscription.hpp"
 #include "rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 #include "realtime_tools/realtime_buffer.hpp"
 #include "realtime_tools/realtime_publisher.hpp"
 #include "ros2_unitree_legged_msgs/msg/motor_cmd.hpp"   // Command type
 #include "ros2_unitree_legged_msgs/msg/motor_state.hpp"   // State type
-#include "ros2_unitree_legged_control_parameters.hpp"
+// #include "ros2_unitree_legged_control_parameters.hpp"
+#include <ros2_unitree_legged_control/ros2_unitree_legged_control_parameters.hpp>
+
 
 #include "control_toolbox/pid.hpp"
 #include <boost/scoped_ptr.hpp>
 #include <boost/thread/condition.hpp>
 #include "std_msgs/msg/float64.hpp"
 #include "ros2_unitree_legged_control/unitree_joint_control_tool.h"
-#include <urdf/model.h>
+
 #include <atomic>
 #include "std_msgs/msg/string.hpp"
+#include <urdf/model.h>
 
 #define PMSM      (0x0A)
 #define BRAKE     (0x00)
@@ -48,6 +51,11 @@ namespace ros2_unitree_legged_control
 {
   using CmdType = ros2_unitree_legged_msgs::msg::MotorCmd;      // Command received (MotorCmd)
   using StateType = ros2_unitree_legged_msgs::msg::MotorState;  // State send (MotorState)
+
+
+
+
+
 /**
  * \brief Forward command controller for a set of effort controlled joints (linear or angular).
  *
@@ -125,23 +133,41 @@ protected:
    */
   controller_interface::CallbackReturn read_parameters();
 
-  urdf::Model model_;
-  std::string urdf_string_;
+  // urdf::Model model_;
 
-  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_desc_sub_;
-  std::atomic_bool urdf_received_{false};
+  // rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_desc_sub_;
+  // std::string urdf_string_;
+  // std::atomic_bool urdf_received_{false};
 
   // Cached limits (avoid dereferencing joint_->limits in update())
   bool limits_loaded_{false};
+  std::string joint_name_;
   double effort_limit_{0.0};
   double vel_limit_{0.0};
   double lower_limit_{0.0};
   double upper_limit_{0.0};
 
-  std::string joint_name_;
+  rclcpp::Time activation_time_;
+  double ramp_sec_{1.0};
+  bool ramp_done_{false};
+
+  // Startup ramp (one-shot)
+  bool ramp_started_{false};
+  rclcpp::Time ramp_start_time_;
+  double startup_ramp_sec_{1.0};   // 0.5–2.0s typical
+
+  // Pose hold before first command
+  bool hold_initialized_{false};
+  double hold_pos_{0.0};
+  double hold_kp_{20.0};           // tune
+  double hold_kd_{1.0};            // tune
+
+
+
+
   int joint_type_; // enumize later
   std::vector<std::string> joint_names_;
-  urdf::JointConstSharedPtr joint_;
+  // urdf::JointConstSharedPtr joint_;
   std::string state_interface_name_;
 
   std::vector<std::string> command_interface_types_;
