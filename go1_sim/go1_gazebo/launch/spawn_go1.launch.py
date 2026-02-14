@@ -100,7 +100,7 @@ def generate_launch_description():
     # So we pass the world path via gz_args using substitutions below instead.
 
     # Pose
-    position = [0.0, 0.0, 0.3]
+    position = [0.0, 0.0, 0.4]
     orientation_rpy = [0.0, 0.0, 0.0]
 
     # 1) Start gz sim with the world
